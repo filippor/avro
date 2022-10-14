@@ -46,14 +46,14 @@ import com.fasterxml.jackson.databind.util.TokenBuffer;
  * JsonDecoder is not thread-safe.
  */
 public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler {
-  private JsonParser in;
+  private BufferedParser in;
   private static JsonFactory jsonFactory = new JsonFactory();
   Stack<ReorderBuffer> reorderBuffers = new Stack<>();
   ReorderBuffer currentReorderBuffer;
 
   private static class ReorderBuffer {
     public Map<String, TokenBuffer> savedFields = new HashMap<>();
-    public JsonParser origParser = null;
+    public BufferedParser origParser = null;
   }
 
   private JsonDecoder(Symbol root, InputStream in) throws IOException {
@@ -97,7 +97,7 @@ public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler 
     parser.reset();
     reorderBuffers.clear();
     currentReorderBuffer = null;
-    this.in = jsonFactory.createParser(in);
+    this.in = new BufferedParser(jsonFactory.createParser(in));
     this.in.nextToken();
     return this;
   }
@@ -120,7 +120,7 @@ public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler 
     parser.reset();
     reorderBuffers.clear();
     currentReorderBuffer = null;
-    this.in = new JsonFactory().createParser(in);
+    this.in = new BufferedParser(new JsonFactory().createParser(in));
     this.in.nextToken();
     return this;
   }
@@ -422,12 +422,27 @@ public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler 
     String label;
     if (in.getCurrentToken() == JsonToken.VALUE_NULL) {
       label = "null";
+    } else if (a.labels.length == 2 && a.findLabel("null") >= 0) {
+      label = "null".equals(a.labels[0]) ? a.labels[1] : a.labels[0];
+      if (in.getCurrentToken() == JsonToken.START_OBJECT) {
+        in.mark();
+        System.out.println(in.currentTokenId());
+        JsonToken nextToken = in.nextToken();
+        if (nextToken == JsonToken.FIELD_NAME) {
+          String fieldName = in.getText();
+          System.out.println(fieldName);
+          if (a.findLabel(fieldName) >= 0) {
+            in.nextToken();
+            parser.pushSymbol(Symbol.UNION_END);
+          } else {
+            in.reset();
+          }
+        }
+      }
     } else if (in.getCurrentToken() == JsonToken.START_OBJECT && in.nextToken() == JsonToken.FIELD_NAME) {
       label = in.getText();
       in.nextToken();
       parser.pushSymbol(Symbol.UNION_END);
-    } else if (a.labels.length == 2 && a.findLabel("null") >= 0) {
-      label = "null".equals(a.labels[0]) ? a.labels[1] : a.labels[0];
     } else {
       throw error("start-union");
     }
@@ -448,7 +463,7 @@ public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler 
           if (tokenBuffer != null) {
             currentReorderBuffer.savedFields.remove(name);
             currentReorderBuffer.origParser = in;
-            in = tokenBuffer.asParser();
+            in = new BufferedParser(tokenBuffer.asParser());
             in.nextToken();
             return null;
           }
@@ -511,6 +526,90 @@ public class JsonDecoder extends ParsingDecoder implements Parser.ActionHandler 
 
   private AvroTypeException error(String type) {
     return new AvroTypeException("Expected " + type + ". Got " + in.getCurrentToken());
+  }
+
+}
+
+class BufferedParser extends com.fasterxml.jackson.core.util.JsonParserDelegate {
+
+  TokenBuffer buffer;
+  private int resetLocation;
+  private int count;
+
+  public BufferedParser(JsonParser d) throws IOException {
+    super(null);
+    int currentLocation = d.currentTokenId();
+
+    buffer = TokenBuffer.asCopyOfValue(d);
+    delegate = buffer.asParserOnFirstToken();
+    while (currentLocation != delegate.currentTokenId()) {
+      count++;
+      delegate.nextToken();
+    }
+
+  }
+
+  public void mark() {
+    resetLocation = count;
+  }
+
+  public void reset() throws IOException {
+    delegate = buffer.asParserOnFirstToken();
+
+    for (count = 0; count < resetLocation; count++) {
+      delegate.nextToken();
+    }
+  }
+
+  @Override
+  public JsonToken nextToken() throws IOException {
+    count++;
+    return super.nextToken();
+  }
+
+  @Override
+  public void clearCurrentToken() {
+    count++;
+    delegate.clearCurrentToken();
+  }
+
+  /**
+   * Need to override, re-implement similar to how method defined in
+   * {@link com.fasterxml.jackson.core.base.ParserMinimalBase}, to keep state
+   * correct here.
+   */
+  @Override
+  public JsonParser skipChildren() throws IOException {
+    if ((getCurrentToken() != JsonToken.START_OBJECT) && (getCurrentToken() != JsonToken.START_ARRAY)) {
+      return this;
+    }
+    int open = 1;
+
+    // Since proper matching of start/end markers is handled
+    // by nextToken(), we'll just count nesting levels here
+    while (true) {
+      JsonToken t = nextToken();
+      if (t == null) { // not ideal but for now, just return
+        return this;
+      }
+      if (t.isStructStart()) {
+        ++open;
+      } else if (t.isStructEnd()) {
+        if (--open == 0) {
+          return this;
+        }
+      }
+    }
+  }
+
+  @Override
+  public JsonToken nextValue() throws IOException {
+    // Re-implemented same as ParserMinimalBase:
+    JsonToken t = nextToken();
+    if (t == JsonToken.FIELD_NAME) {
+      t = nextToken();
+    }
+    return t;
   }
 
 }
